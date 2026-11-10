@@ -1,0 +1,465 @@
+import argparse
+import asyncio
+import html
+import json
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse
+
+from playwright.async_api import async_playwright
+
+
+API_MARKER = "/api/story/item_list/"
+SAFE_QUERY_KEYS = {
+    "authorId", "count", "cursor", "loadBackward",
+    "user_is_login", "region", "language", "WebIdLastTime",
+}
+CDN_HOST_HINTS = (
+    "tiktokcdn.com",
+    "tiktokv.com",
+    "byteoversea.com",
+    "ibytedtos.com",
+    "muscdn.com",
+)
+MAX_WAIT_SECONDS = 12
+
+
+def valid_username(value: str) -> str:
+    value = value.strip().lstrip("@")
+    if not re.fullmatch(r"[A-Za-z0-9._]{2,24}", value):
+        raise ValueError("اسم المستخدم غير صالح. استخدم الحروف والأرقام والنقطة والشرطة السفلية فقط.")
+    return value
+
+
+def walk_dicts(value):
+    """Yield every dictionary nested in a JSON object."""
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from walk_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from walk_dicts(child)
+
+
+def find_story_container(payload):
+    """Find the dictionary that actually contains itemList."""
+    for obj in walk_dicts(payload):
+        items = obj.get("itemList")
+        if isinstance(items, list):
+            return obj, items
+    return {}, []
+
+
+def first_url(value):
+    """Read a URL from a string or common URL-list object."""
+    if isinstance(value, str) and value.startswith("https://"):
+        return value
+    if isinstance(value, dict):
+        for key in ("urlList", "UrlList", "url_list"):
+            urls = value.get(key)
+            if isinstance(urls, list):
+                for candidate in urls:
+                    found = first_url(candidate)
+                    if found:
+                        return found
+        for key in ("url", "Url", "uri", "Uri"):
+            found = first_url(value.get(key))
+            if found:
+                return found
+    if isinstance(value, list):
+        for candidate in value:
+            found = first_url(candidate)
+            if found:
+                return found
+    return None
+
+
+def all_urls(value):
+    """Return unique https URLs from common URL-list shapes."""
+    found = []
+
+    def visit(node):
+        if isinstance(node, str):
+            if node.startswith("https://"):
+                found.append(node)
+        elif isinstance(node, dict):
+            for key in ("urlList", "UrlList", "url_list"):
+                if isinstance(node.get(key), list):
+                    visit(node[key])
+            for key in ("url", "Url", "uri", "Uri"):
+                if isinstance(node.get(key), str):
+                    visit(node[key])
+        elif isinstance(node, list):
+            for child in node:
+                visit(child)
+
+    visit(value)
+    result = []
+    seen = set()
+    for url in found:
+        if url not in seen:
+            seen.add(url)
+            result.append(url)
+    return result
+
+
+def is_media_url(url):
+    try:
+        host = (urlparse(url).hostname or "").lower()
+        return url.startswith("https://") and any(hint in host for hint in CDN_HOST_HINTS)
+    except Exception:
+        return False
+
+
+def extract_images(item):
+    images = []
+    image_post = item.get("imagePost")
+    if not isinstance(image_post, dict):
+        return images
+
+    entries = image_post.get("images")
+    if not isinstance(entries, list):
+        return images
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        image_url = entry.get("imageURL") or entry.get("imageUrl") or entry.get("displayImage")
+        candidates = [u for u in all_urls(image_url) if is_media_url(u)]
+        # TikTok commonly returns mirrored CDN URLs for the same image.
+        # Keep one mirror per image to avoid showing duplicates.
+        if candidates:
+            images.append(candidates[0])
+    return images
+
+
+def extract_videos(item):
+    videos = []
+    video_obj = item.get("video")
+    if not isinstance(video_obj, dict):
+        return videos
+
+    # Only fields that represent playable/downloadable video media.
+    # Deliberately exclude cover/originCover and music.playUrl.
+    for key in ("playAddr", "downloadAddr", "play_addr", "download_addr"):
+        candidates = [u for u in all_urls(video_obj.get(key)) if is_media_url(u)]
+        for url in candidates:
+            if url not in videos:
+                videos.append(url)
+
+    for key in ("bitrateInfo", "bitRateInfo", "bit_rate_info"):
+        entries = video_obj.get(key)
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                for addr_key in ("PlayAddr", "playAddr", "play_addr", "DownloadAddr", "downloadAddr"):
+                    candidates = [u for u in all_urls(entry.get(addr_key)) if is_media_url(u)]
+                    for url in candidates:
+                        if url not in videos:
+                            videos.append(url)
+    return videos
+
+
+def parse_story(item):
+    if not isinstance(item, dict):
+        return None
+
+    images = extract_images(item)
+    videos = extract_videos(item)
+    if images:
+        media_type = "photo"
+    elif videos:
+        media_type = "video"
+    else:
+        media_type = "unknown"
+
+    author = item.get("author") if isinstance(item.get("author"), dict) else {}
+    story = item.get("story") if isinstance(item.get("story"), dict) else {}
+
+    return {
+        "id": str(item.get("id") or item.get("aweme_id") or ""),
+        "create_time": item.get("createTime") or item.get("create_time"),
+        "expired_at": story.get("ExpiredAt") or story.get("expiredAt") or item.get("expiredAt"),
+        "viewed": story.get("Viewed") if "Viewed" in story else story.get("viewed"),
+        "media_type": media_type,
+        "images": images,
+        "videos": videos,
+        "author": {
+            "username": author.get("uniqueId") or author.get("unique_id"),
+            "nickname": author.get("nickname"),
+            "private_account": author.get("privateAccount"),
+            "story_status": author.get("UserStoryStatus") or author.get("userStoryStatus"),
+        },
+    }
+
+
+def safe_parameters(url):
+    """Keep only non-signature diagnostic parameters; never save anti-bot tokens."""
+    from urllib.parse import parse_qs
+    parsed = urlparse(url)
+    raw = parse_qs(parsed.query)
+    return {
+        key: values
+        for key, values in raw.items()
+        if key in SAFE_QUERY_KEYS
+    }
+
+
+def challenge_visible(page_text, title):
+    text = f"{title}\n{page_text}".lower()
+    phrases = (
+        "verify to continue",
+        "security verification",
+        "complete the puzzle",
+        "solve the puzzle",
+        "drag the puzzle",
+        "captcha",
+        "puzzle verification",
+    )
+    return any(phrase in text for phrase in phrases)
+
+
+def fmt_timestamp(value):
+    try:
+        number = int(value)
+        if number > 10_000_000_000:
+            number //= 1000
+        return datetime.fromtimestamp(number, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return "غير متاح"
+
+
+def build_gallery(username, stories, report_path):
+    cards = []
+    for index, story in enumerate(stories, start=1):
+        story_id = html.escape(story.get("id") or f"story-{index}")
+        created = fmt_timestamp(story.get("create_time"))
+        expiry = fmt_timestamp(story.get("expired_at"))
+        media_parts = []
+
+        for image_index, url in enumerate(story.get("images", []), start=1):
+            safe_url = html.escape(url, quote=True)
+            media_parts.append(
+                f'<div class="media"><img loading="lazy" src="{safe_url}" '
+                f'alt="Story photo {image_index}">'
+                f'<a class="download" href="{safe_url}" target="_blank" rel="noopener" '
+                f'download>فتح / تنزيل الصورة {image_index}</a></div>'
+            )
+
+        for video_index, url in enumerate(story.get("videos", []), start=1):
+            safe_url = html.escape(url, quote=True)
+            media_parts.append(
+                f'<div class="media"><video controls preload="metadata" src="{safe_url}"></video>'
+                f'<a class="download" href="{safe_url}" target="_blank" rel="noopener" '
+                f'download>فتح / تنزيل الفيديو {video_index}</a></div>'
+            )
+
+        if not media_parts:
+            media_parts.append('<p class="muted">لم يُعثر على رابط صورة أو فيديو مباشر لهذا العنصر.</p>')
+
+        cards.append(
+            f'<article class="card"><div class="meta"><b>Story #{index}</b>'
+            f'<span>ID: {story_id}</span><span>النوع: {html.escape(story.get("media_type", "unknown"))}</span>'
+            f'<span>النشر: {html.escape(created)}</span><span>الانتهاء: {html.escape(expiry)}</span></div>'
+            f'<div class="grid">{"".join(media_parts)}</div></article>'
+        )
+
+    if not cards:
+        cards_html = '<div class="empty">ما وصلنا أي Story قابلة للعرض في هذه الجلسة.</div>'
+    else:
+        cards_html = "".join(cards)
+
+    page = f"""<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TikView — @{html.escape(username)}</title>
+<style>
+*{{box-sizing:border-box}}body{{margin:0;background:#101116;color:#f5f5f7;font-family:Arial,sans-serif}}
+header{{padding:28px 5vw;background:#191b24;border-bottom:1px solid #30323d}}
+h1{{margin:0 0 8px;font-size:28px}}p{{color:#b9bbc7;line-height:1.7}}
+main{{width:min(1100px,92vw);margin:26px auto}}
+.card{{background:#1b1d27;border:1px solid #30323d;border-radius:16px;padding:18px;margin:18px 0}}
+.meta{{display:flex;gap:12px;flex-wrap:wrap;align-items:center;color:#c8cad4;font-size:13px;margin-bottom:14px}}
+.meta b{{font-size:16px;color:#fff}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}}
+.media{{background:#11131a;border-radius:12px;padding:10px;min-width:0}}
+img,video{{display:block;width:100%;max-height:620px;object-fit:contain;border-radius:8px;background:#08090c}}
+.download{{display:inline-block;margin-top:10px;color:#fff;background:#e83468;padding:9px 13px;border-radius:9px;text-decoration:none;font-size:13px}}
+.muted,.empty{{color:#b9bbc7}}.empty{{padding:30px;background:#1b1d27;border-radius:14px}}
+footer{{color:#888b98;font-size:12px;padding:22px 5vw;text-align:center}}
+</style>
+</head>
+<body>
+<header><h1>TikView</h1><p>Stories العامة التي تم التقاطها للحساب <b>@{html.escape(username)}</b>.
+هذه الصفحة تعرض العناصر التي رجعت فعليًا فقط، ولا تعني أن كل Stories الحساب تم جلبها.</p></header>
+<main>{cards_html}</main>
+<footer>تم إنشاء المعرض محليًا بواسطة TikView v1.2 — تقرير البيانات: {html.escape(report_path.name)}</footer>
+</body></html>"""
+    return page
+
+
+async def run(username, output_dir):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    profile_url = f"https://www.tiktok.com/@{username}"
+    captured = []
+    challenge = False
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False)
+        # Fresh context: no imported cookies, no saved storage state.
+        context = await browser.new_context(
+            locale="en-US",
+            viewport={"width": 1365, "height": 900},
+        )
+        page = await context.new_page()
+
+        async def on_response(response):
+            try:
+                if API_MARKER not in response.url:
+                    return
+                body = await response.body()
+                payload = json.loads(body.decode("utf-8", errors="replace"))
+                container, items = find_story_container(payload)
+                stories = []
+                for item in items:
+                    parsed = parse_story(item)
+                    if parsed:
+                        stories.append(parsed)
+
+                captured.append({
+                    "http_status": response.status,
+                    "path": API_MARKER,
+                    "parameters": safe_parameters(response.url),
+                    "status_code": container.get("status_code", payload.get("status_code")),
+                    "status_msg": container.get("status_msg", payload.get("status_msg")),
+                    "total_count": container.get("TotalCount") or container.get("total_count"),
+                    "has_more_after": container.get("HasMoreAfter") if "HasMoreAfter" in container else container.get("has_more_after"),
+                    "has_more_before": container.get("HasMoreBefore") if "HasMoreBefore" in container else container.get("has_more_before"),
+                    "current_position": container.get("CurrentPosition") or container.get("current_position"),
+                    "max_cursor": container.get("MaxCursor") or container.get("max_cursor"),
+                    "min_cursor": container.get("MinCursor") or container.get("min_cursor"),
+                    "stories_returned": len(stories),
+                    "stories": stories,
+                })
+                print(f"[API] status={response.status} | stories parsed={len(stories)}")
+            except Exception as exc:
+                print(f"[API] تعذر تحليل استجابة Story: {exc}")
+
+        page.on("response", on_response)
+
+        print(f"[1/5] فتح الحساب: {profile_url}")
+        try:
+            await page.goto(profile_url, wait_until="domcontentloaded", timeout=45000)
+        except Exception as exc:
+            print(f"[تنبيه] تعذر اكتمال التنقل: {exc}")
+
+        print(f"[2/5] انتظار تحميل بيانات الصفحة ({MAX_WAIT_SECONDS} ثانية)...")
+        await page.wait_for_timeout(MAX_WAIT_SECONDS * 1000)
+
+        try:
+            title = await page.title()
+            body_text = await page.locator("body").inner_text(timeout=5000)
+            challenge = challenge_visible(body_text[:12000], title)
+        except Exception:
+            title, body_text = "", ""
+
+        if challenge:
+            print("[توقف] ظهرت صفحة تحقق/حماية. لن نحاول تجاوزها.")
+        else:
+            print("[3/5] انتهى الانتظار. لم يتم فتح Story playback أو الضغط على أي Story.")
+
+        await context.close()
+        await browser.close()
+
+    # Merge repeated responses without counting CDN mirrors as separate media.
+    merged = {}
+    totals = []
+    pagination_signals = []
+    for response in captured:
+        if response.get("total_count") is not None:
+            try:
+                totals.append(int(response["total_count"]))
+            except Exception:
+                pass
+        pagination_signals.append({
+            "has_more_after": response.get("has_more_after"),
+            "has_more_before": response.get("has_more_before"),
+            "current_position": response.get("current_position"),
+            "max_cursor": response.get("max_cursor"),
+            "min_cursor": response.get("min_cursor"),
+        })
+        for story in response.get("stories", []):
+            key = story.get("id") or json.dumps(story, sort_keys=True)
+            if key not in merged:
+                merged[key] = story
+            else:
+                # Merge distinct media URLs for a story repeated across responses.
+                for field in ("images", "videos"):
+                    for url in story.get(field, []):
+                        if url not in merged[key][field]:
+                            merged[key][field].append(url)
+
+    stories = list(merged.values())
+    image_count = sum(len(s["images"]) for s in stories)
+    video_count = sum(len(s["videos"]) for s in stories)
+    report = {
+        "version": "1.2",
+        "username": username,
+        "profile_url": profile_url,
+        "login_or_imported_cookies_used": False,
+        "challenge_detected": challenge,
+        "responses_captured": len(captured),
+        "api_reported_total_max": max(totals) if totals else None,
+        "stories_extracted_unique": len(stories),
+        "images_extracted": image_count,
+        "videos_extracted": video_count,
+        "pagination": {
+            "signals": pagination_signals,
+            "automatic_pagination_attempted": False,
+            "note": "لم يتم تخمين cursor أو إرسال طلب pagination يدويًا؛ نحتاج إثبات سلوك الصفحة أولًا.",
+        },
+        "responses": captured,
+        "stories": stories,
+    }
+
+    report_path = output_dir / f"tikview_{username}_v12_report.json"
+    gallery_path = output_dir / f"tikview_{username}_v12_gallery.html"
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    gallery_path.write_text(build_gallery(username, stories, report_path), encoding="utf-8")
+
+    print("[4/5] ملخص النتيجة:")
+    print(f"  استجابات Story API: {len(captured)}")
+    print(f"  Stories فريدة مستخرجة: {len(stories)}")
+    print(f"  صور: {image_count}")
+    print(f"  فيديوهات بروابط مباشرة: {video_count}")
+    print(f"  إجمالي API المعلن (أعلى قيمة): {report['api_reported_total_max']}")
+    print(f"  اكتشاف تحقق: {'نعم' if challenge else 'لا'}")
+    print("[5/5] الملفات:")
+    print(f"  تقرير JSON: {report_path.resolve()}")
+    print(f"  معرض HTML: {gallery_path.resolve()}")
+    print("\nافتح ملف HTML بالمتصفح لمشاهدة العناصر التي تم جلبها.")
+    print("ملاحظة: لا تعتبر TotalCount عدد العناصر التي تم تنزيلها؛ اعتمد على Stories المستخرجة فعليًا.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="TikView v1.2 — public TikTok Story probe")
+    parser.add_argument("username", help="اسم المستخدم بدون @ أو معه")
+    parser.add_argument("--output", default="tikview_output", help="مجلد حفظ النتائج")
+    args = parser.parse_args()
+
+    try:
+        username = valid_username(args.username)
+    except ValueError as exc:
+        print(f"خطأ: {exc}")
+        sys.exit(2)
+
+    asyncio.run(run(username, Path(args.output)))
+
+
+if __name__ == "__main__":
+    main()
